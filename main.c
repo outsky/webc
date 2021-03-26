@@ -1,3 +1,8 @@
+/*
+- 发送大文件问题
+- Content-type获取
+- 压缩
+*/
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -7,6 +12,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
+#include <zlib.h>
 
 int Listen(const char *port, int backlog) {
     struct addrinfo hint, *res = NULL;
@@ -81,6 +87,217 @@ int Epoll_remove(int ep, int fd) {
     return 0;
 }
 
+int OnNewConnect(int ep, int svr) {
+	int clt = Accept(svr);
+    if (clt < 0)
+        return -1;
+    return Epoll_add(ep, clt);
+}
+
+void Response(int ep, int clt, const char* version, int code, const char* reason, const char *type, const char* body, long bodysize) {
+    long bufsize = 256 + bodysize;
+    char* buf = (char*)malloc(bufsize);
+    memset(buf, 0, bufsize);
+
+    sprintf(buf, "%s %d %s\r\nContent-Length: %d\r\nContent-Type: %s\r\n\r\n%s", version, code, reason, bodysize, type, bodysize == 0 ? "" : body);
+
+    long left = strlen(buf);
+    const char* current = buf;
+    while (left > 0) {
+        long n = send(clt, current, left, 0);
+        printf("===> %ld, %ld\n", left, n);
+        if (n < 0) {
+			printf("[!] disconnected: %d\n", clt);
+			Epoll_remove(ep, clt);
+			return;
+        }
+        left -= n;
+        current += n;
+    }
+    free(buf);
+    buf = NULL;
+    close(clt);
+}
+
+const char* GetUriType(const char* uri) {
+    static const char* types[] = {
+        "text/html",
+        "image/png",
+    };
+    const char* begin = strrchr(uri, '.');
+    char postfix[16];
+    strcpy(postfix, begin + 1);
+    int type = 0;
+    if (strcmp(postfix, "png") == 0) {
+        type = 1;
+    }
+    return types[type];
+}
+
+int gzCompress(const char* src, int srcLen, char* dest, int destLen)
+{
+    z_stream c_stream;
+    int err = 0;
+    int windowBits = 15;
+    int GZIP_ENCODING = 16;
+
+    if (src && srcLen > 0)
+    {
+        c_stream.zalloc = (alloc_func)0;
+        c_stream.zfree = (free_func)0;
+        c_stream.opaque = (voidpf)0;
+        if (deflateInit2(&c_stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+            windowBits | GZIP_ENCODING, 8, Z_DEFAULT_STRATEGY) != Z_OK) return -1;
+        c_stream.next_in = (Bytef*)src;
+        c_stream.avail_in = srcLen;
+        c_stream.next_out = (Bytef*)dest;
+        c_stream.avail_out = destLen;
+        while (c_stream.avail_in != 0 && c_stream.total_out < destLen)
+        {
+            if (deflate(&c_stream, Z_NO_FLUSH) != Z_OK) return -1;
+        }
+        if (c_stream.avail_in != 0) return c_stream.avail_in;
+        for (;;) {
+            if ((err = deflate(&c_stream, Z_FINISH)) == Z_STREAM_END) break;
+            if (err != Z_OK) return -1;
+        }
+        if (deflateEnd(&c_stream) != Z_OK) return -1;
+        return c_stream.total_out;
+    }
+    return -1;
+}
+
+int data_compress(const char* idata, int ilen, char* odata, int* olen)
+{
+    z_stream z = { 0 };
+
+    z.next_in = (Bytef*)idata;
+    z.avail_in = ilen;
+    z.next_out = (Bytef*)odata;
+    z.avail_out = *olen;
+
+    printf("total %u bytes\n", z.avail_in);
+
+    /* 使用最高压缩比 */
+    if (deflateInit(&z, Z_BEST_COMPRESSION) != Z_OK) {
+        printf("deflateInit failed!\n");
+        return -1;
+    }
+
+    if (deflate(&z, Z_NO_FLUSH) != Z_OK) {
+        printf("deflate Z_NO_FLUSH failed!\n");
+        return -1;
+    }
+
+    if (deflate(&z, Z_FINISH) != Z_STREAM_END) {
+        printf("deflate Z_FINISH failed!\n");
+        return -1;
+    }
+
+    if (deflateEnd(&z) != Z_OK) {
+        printf("deflateEnd failed!\n");
+        return -1;
+    }
+
+    *olen = *olen - z.avail_out;
+
+    printf("compressed data %d bytes.\n", *olen);
+
+    return 0;
+}
+
+void ProcessGet(int ep, int clt, const char *uri, const char *version, const char *type, int gzip) {
+    char* buf = NULL;
+    long bufsize = 0;
+    int code = 404;
+    const char* reason = "are you fucking hacker?!!";
+    char path[1024];
+    sprintf(path, "/home/outsky/webc%s", uri);
+    FILE *f = fopen(path, "rb");
+    if (f != NULL) {
+        code = 200;
+        reason = "OK";
+        fseek(f, 0, SEEK_END);
+        bufsize = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        buf = (char*)malloc(bufsize);
+        long size = fread(buf, 1, bufsize, f);
+        if (size != bufsize) {
+            printf("[!] fread size not equal: %ld, %ld\n", bufsize, size);
+            bufsize = size;
+        }
+
+        if (gzip != 0) {
+            char* dest = (char*)malloc(bufsize * 2);
+            //bufsize = gzCompress(buf, bufsize, dest, bufsize * 2);
+            data_compress(buf, bufsize, dest, (int*)&bufsize);
+            if (bufsize < 0) {
+                printf("[!] gzCompress %s failed!\n", path);
+            }
+            free(buf);
+            buf = dest;
+        }
+    }
+    else {
+        printf("<%s>\n", path);
+        perror("[x] fopen");
+    }
+
+    //const char* type = GetUriType(uri);
+    Response(ep, clt, version, code, reason, type, buf, bufsize);
+    if (buf != NULL) {
+        free(buf);
+        buf = NULL;
+    }
+}
+
+void ProcessMsg(int ep, int clt, const char* buf, long len) {
+    char method[16], uri[256], version[16];
+    char* parts[3] = { method, uri, version };
+    const char* begin = buf;
+    for (int i = 0; i < 3; ++i) {
+        const char* end = strpbrk(begin, " \r");
+        strncpy(parts[i], begin, end - begin);
+        parts[i][end - begin] = '\0';
+        begin = end + 1;
+    }
+
+    char type[32] = "text/html";
+    begin = strstr(begin, "Accept: ");
+    if (begin != NULL) {
+        begin += 8;
+        const char *end = strpbrk(begin, ",\r");
+        if (end != NULL) {
+            strncpy(type, begin, end - begin);
+            type[end - begin] = '\0';
+        }
+    }
+
+    int gzip = strstr(buf, "gzip") != NULL;
+
+    if (strcmp(method, "GET") == 0) {
+        ProcessGet(ep, clt, uri, version, type, gzip);
+    }
+    else {
+        printf("[x] unsupported method: %s\n", method);
+    }
+}
+
+void OnMsg(int ep, int clt) {
+	char buf[1024];
+    long len = recv(clt, buf, sizeof(buf), 0);
+	if (len <= 0) {
+		printf("[!] disconnected: %d\n", clt);
+		Epoll_remove(ep, clt);
+        return;
+	}
+    buf[len] = '\0';
+
+    printf("[%d] -> %s(%ld)\n", clt, buf, len);
+
+    ProcessMsg(ep, clt, buf, len);
+}
+
 int main()
 {
     signal(SIGPIPE, SIG_IGN);
@@ -116,32 +333,10 @@ int main()
             }
 
             if (e->data.fd == svr) {
-				int clt = Accept(svr);
-				if (clt < 0)
-					continue;
-
-                const char* hello = "hello fucking world!\r\n";
-                send(clt, hello, strlen(hello), 0);
-
-                if (Epoll_add(ep, clt) != 0) {
-                    return -1;
-                }
+                OnNewConnect(ep, e->data.fd);
             }
             else {
-				char buf[64];
-                int clt = e->data.fd;
-				if (read(clt, buf, sizeof(buf)) < 0) {
-                    printf("[!] disconnected: %d\n", clt);
-                    Epoll_remove(ep, clt);
-					continue;
-				}
-				int i = atoi(buf);
-				sprintf(buf, "%d\r\n", i + 1);
-				if (send(clt, buf, strlen(buf), 0) < 0) {
-					printf("[!] disconnected: %d\n", clt);
-                    Epoll_remove(ep, clt);
-					continue;
-				}
+                OnMsg(ep, e->data.fd);
             }
         }
     }
